@@ -251,26 +251,37 @@ def _get_components(video):
     return None
 
 
+def _comp_attr(comp, *names, default=None):
+    """Lee el primer atributo disponible (o clave si comp es dict)."""
+    for name in names:
+        if hasattr(comp, name):
+            v = getattr(comp, name)
+            if v is not None:
+                return v
+        if isinstance(comp, dict) and name in comp and comp[name] is not None:
+            return comp[name]
+    return default
+
+
 def _stack_frames_and_fps(videos):
     """
-    Extrae frames y fps de una lista de VIDEO y los devuelve como
-    (tensor IMAGE (N,H,W,C), fps). Redimensiona al tamaño del primero si hace falta.
+    Extrae frames y frame_rate de una lista de VIDEO y los devuelve como
+    (tensor IMAGE (N,H,W,C), frame_rate).
+    Redimensiona al tamaño del primero si hace falta.
     """
     import torch
     import torch.nn.functional as F
 
     all_frames = []
-    fps = None
+    frame_rate = None
 
     for v in videos:
         comp = _get_components(v)
         imgs = None
         if comp is not None:
-            imgs = getattr(comp, "images", None)
-            if imgs is None and isinstance(comp, dict):
-                imgs = comp.get("images")
-            if fps is None:
-                fps = getattr(comp, "fps", None) or (comp.get("fps") if isinstance(comp, dict) else None)
+            imgs = _comp_attr(comp, "images")
+            if frame_rate is None:
+                frame_rate = _comp_attr(comp, "frame_rate", "fps")
         if imgs is None and isinstance(v, torch.Tensor):
             imgs = v
         if imgs is None:
@@ -289,26 +300,67 @@ def _stack_frames_and_fps(videos):
             t = x.permute(0, 2, 3, 1)
         resized.append(t)
 
-    return torch.cat(resized, dim=0), (fps or 24.0)
+    return torch.cat(resized, dim=0), float(frame_rate or 24.0)
+
+
+def _load_video_types():
+    """Intenta importar (VideoFromComponents, VideoComponents) de varias rutas."""
+    candidates = (
+        "comfy_api.latest._input_impl.video_types",
+        "comfy_api.input_impl.video_types",
+    )
+    import importlib
+    for path in candidates:
+        try:
+            mod = importlib.import_module(path)
+            vfc = getattr(mod, "VideoFromComponents", None)
+            vc  = getattr(mod, "VideoComponents",   None)
+            if vfc is not None:
+                return vfc, vc
+        except Exception:
+            continue
+    return None, None
 
 
 def _concat_videos(videos):
     """
-    Concatena videos de forma best-effort. Si el pack expone VideoFromComponents
-    lo usa; si no, devuelve el tensor de frames (ComfyUI moderno acepta
-    un batch IMAGE como VIDEO en muchos contextos).
+    Concatena videos. Si el pack expone VideoFromComponents + VideoComponents
+    los usa con el kwarg correcto (`frame_rate`). Si no, devuelve el tensor
+    de frames (ComfyUI moderno acepta un batch IMAGE como VIDEO en muchos
+    contextos).
     """
-    frames, fps = _stack_frames_and_fps(videos)
+    frames, frame_rate = _stack_frames_and_fps(videos)
+
+    VideoFromComponents, VideoComponents = _load_video_types()
+    if VideoFromComponents is None:
+        return frames
+
+    # Build a components object that definitely has `frame_rate`, `images`
+    # and `audio` attributes. If VideoComponents is a dataclass/namedtuple,
+    # try it first; else fall back to a simple object with the right names.
+    comp = None
+    if VideoComponents is not None:
+        for kwargs in (
+            {"images": frames, "audio": None, "frame_rate": frame_rate},
+            {"images": frames, "audio": None, "fps": frame_rate},
+        ):
+            try:
+                comp = VideoComponents(**kwargs)
+                break
+            except Exception:
+                continue
+    if comp is None:
+        comp = type("VC", (), {
+            "images":     frames,
+            "audio":      None,
+            "frame_rate": frame_rate,
+            "fps":        frame_rate,
+        })()
 
     try:
-        from comfy_api.input_impl.video_types import VideoFromComponents  # type: ignore
-        try:
-            from comfy_api.input_impl.video_types import VideoComponents  # type: ignore
-            comp = VideoComponents(images=frames, audio=None, fps=float(fps))
-        except Exception:
-            comp = type("VC", (), {"images": frames, "audio": None, "fps": float(fps)})()
         return VideoFromComponents(comp)
-    except Exception:
+    except Exception as exc:
+        print(f"[VideoConcatParallel] VideoFromComponents falló ({exc}); devuelvo frames.")
         return frames
 
 
